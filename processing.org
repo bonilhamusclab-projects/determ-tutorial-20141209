@@ -1,0 +1,149 @@
+#+AUTHOR: Travis Nesland
+#+EMAIL: tnesland@gmail.com
+#+DATE: {{{time(%m-%d-%Y)}}}
+#+TITLE: LIME Pipeline: Deterministic
+#+OPTIONS: toc:nil
+
+* Requirements
+
+  - [[http://www.nitrc.org/projects/mricrogl][MRIcroGL]]
+  - [[http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/][FSL]]
+  - [[http://trackvis.org/dtk/][Diffusion Toolkit]]
+
+* Retrieve DICOMs
+
+  Input: List of subjects to be retrieved
+  Output: Set of DICOMs for each subject
+
+* Convert DICOMs to NIfTI
+  
+  1) Launch [[http://www.nitrc.org/projects/mricrogl][MRIcroGL]].
+  2) Select Import >> Convert DICOM to NIfTI
+  3) Specify Subject's DICOM directory
+
+* Organize Images
+
+  After conversion, locate, select, and stage the following images:
+
+  #+NAME: organize_images
+  #+BEGIN_SRC sh :var subject_dir="../data/NIfTI/023NB_SC" :exports results
+    ls ${subject_dir}
+  #+END_SRC
+  #+RESULTS: organize_images
+  | bvals      |
+  | bvecs      |
+  | dki.nii.gz |
+  | t1.nii.gz  |
+  #+RESULTS:
+
+* Preprocess Diffusion
+
+** Motion correction / eddy
+
+   If you have a *reverse encoded* diffusion image or approximately
+   *60 diffusion directions distributed about the entire sphere*,
+   rather than a half sphere, then you can use [[http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/EDDY][FSL's EDDY]] with the
+   help of [[http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/TOPUP][TOPUP]] to simultaneously correct for head motion and eddy
+   currents.
+
+   However, in most cases you will find that we only have a single
+   encoding of the diffusion sequence and that the diffusion
+   directions are distributed about a half-sphere. In this case, you
+   can only correct for head motion using [[http://fsl.fmrib.ox.ac.uk/fsl/fsl-4.1.9/fdt/fdt_eddy.html][FSL's eddy_correct]].
+
+   #+NAME: eddy_correction
+   #+BEGIN_SRC sh :var subject_dir="../data/NIfTI/023NB_SC" :exports code :tangle yes
+     eddy_correct ${subject_dir}/dki ${subject_dir}/dki_eddy 0
+   #+END_SRC
+
+** Brain extraction
+
+   Remove the non-brain tissue of the skull using [[http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/BET][FSL's BET]].
+
+   #+NAME: brain_extraction
+   #+BEGIN_SRC sh :var subject_dir="../data/NIfTI/023NB_SC" :exports code :tangle yes
+     # extract the first volume (b0)
+     # fslroi <input> <output> <start at first volume> <take 1 volume>
+     fslroi ${subject_dir}/dki_eddy ${subject_dir}/b0 0 1
+     # bet <input> <output>
+     bet ${subject_dir}/b0 ${subject_dir}/dki_eddy_brain -f 0.3 -n -m
+   #+END_SRC
+
+   #+RESULTS: brain_extraction
+
+   #+NAME: brain_mask
+   #+CAPTION: dki_brain_mask overlayed on b0
+   [[./qc/brain_mask.png]]
+
+** Prepare FA maps
+
+   This is DKI data, but the *LIME pipeline* was developed for DTI
+   data. We can use the b1000 volumes, treat as DTI, and generate
+   scalar maps to use in normalization as was done in the *LIME
+   pipeline*.
+
+   #+NAME: generate_fa_maps
+   #+BEGIN_SRC sh :var subject_dir="../data/NIfTI/023NB_SC" :exports code :cache yes :tangle yes
+     # use FSL's DTIFIT to generate scalar maps
+     dtifit -k ${subject_dir}/dki_eddy -o ${subject_dir}/dki_eddy \
+         -m ${subject_dir}/dki_eddy_brain_mask \
+         -r ${subject_dir}/bvecs -b ${subject_dir}/bvals
+     # erode FA a bit
+     fslmaths ${subject_dir}/dki_eddy_FA -ero ${subject_dir}/dki_eddy_FA_ero
+     # threshold resulting FA map at an appropriate threshold (to be used
+     # in tractography)
+     FA_THRESH=0.20
+     fslmaths ${subject_dir}/dki_eddy_FA_ero -thr $FA_THRESH -bin \
+         ${subject_dir}/dki_eddy_FA_ero_${FA_THRESH} -odt char
+   #+END_SRC
+
+   #+NAME: FA
+   #+CAPTION: FA overlayed on b0 
+   [[./qc/FA.png]]
+
+* Prepare ROIs
+
+** Warp ROIs to DTI space
+   
+   If no lesion exists, we simply register ROIs to diffusion space
+   using [[http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FLIRT][FSL's FLIRT]].
+
+   #+NAME: register_rois_to_diff
+   #+BEGIN_SRC sh :var subject_dir="../data/NIfTI/023NB_SC" template_dir="../templates" :tangle yes
+     TEMPLATE=${template_dir}/mni152_2009_1mm
+     TEMPLATE_ROI=${template_dir}/jhu1mm
+     # Chris' flirt options
+     flirt_opts="-bins 256 -cost corratio -searchrx -45 45 -searchry -45 45 -searchrz -45 45 -dof 12 -interp trilinear"
+     flirt -in ${TEMPLATE} -ref ${subject_dir}/dki_eddy_FA_ero \
+         -out ${subject_dir}/std_to_diff -omat ${subject_dir}/std_to_diff.mat \
+         $flirt_opts
+     flirt -in ${TEMPLATE_ROI} -ref ${subject_dir}/dki_eddy_FA_ero \
+         -out ${subject_dir}/roi_to_diff -applyxmf \
+         -init ${subject_dir}/std_to_diff.mat -interp nearestneighbour
+   #+END_SRC
+
+   Unlike the probabilistic LIME pipeline, where we wanted to isolate
+   the portions of our ROI with FA greater than some threshold, we
+   actually want to remove areas of high FA from our ROIs. To do this
+   we need to mask our ROIs (already registered to diffusion space)
+   with the inverse of our thresholded FA mask.
+
+   #+NAME: mask_rois_with_fa
+   #+BEGIN_SRC sh :var subject_dir="../data/NIfTI/023NB_SC" :tangle yes
+     # create the inverse of our existing FA mask
+     fslmaths ${subject_dir}/dki_eddy_FA_ero_${FA_THRESH} -binv \
+         ${subject_dir}/dki_eddy_FA_ero_${FA_THRESH}_inv
+     # mask our existing ROIs by this newly created binary inverse
+     fslmaths ${subject_dir}/roi_to_diff \
+         -mas ${subject_dir}/dki_eddy_FA_ero_${FA_THRESH}_inv \
+         ${subject_dir}/roi_to_diff_thr
+   #+END_SRC
+
+   #+NAME: rois_to_diff
+   #+CAPTION: Regions of interest registered to FA and after removal of every voxel where FA > Threshold
+   [[./qc/rois_to_diff.png]]
+
+* Streamline Tracking
+
+* Quantify Streamlines
+
